@@ -35,7 +35,16 @@ The `vla-integration` branch is based on upstream commit `e2cd2f72110b66bd65afab
 - `get_arrays(packed=True, stream=...)` reads native transition inputs with one packed copy on the supplied Warp stream; it requires Torch. The default reference readback remains available.
 - `finalize_transition(action, arrays=None)` computes native observations, rewards, termination and numerical-failure checks after externally executed physics. Ordinary `step` uses the same method.
 
-LeRobot integration, contact-audit policy, video rendering and datasets remain in the vla repository. Run the extension tests with `MUJOCO_GL=egl python -m pytest tests/test_vla_extensions.py` in an environment with MuJoCo Warp, Torch and pytest.
+Explicit GPU rendering APIs live in `ocbench.mjwarp.rendering`; native environment rendering methods are unchanged:
+
+- `BatchRenderer(env)` renders cached live transforms as CPU RGB dictionaries or GPU BGRA tensors ordered `(world, camera, height, width, 4)` (front, wrist).
+- `TemporalRenderer(env, task, batch)` captures live transforms and appearance without recomputing kinematics. Slots group timestamps before worlds; partial batches pad the last frame. Batch 1 borrows the live environment and must render before the next physics step.
+- `TrajectoryRenderer(env, arrays, lengths, render_batch_frames=1)` uploads recorded simulator fields once and recomputes kinematics for replay. Unequal trajectories pad their final state. CUDA graph replay requires temporal batch 1.
+- `image_shape` and `rendering_profile` define the shared camera dimensions and image provenance contract.
+
+Pass the producer Warp `stream` when using a nondefault stream. Device output is borrowed until the next render unless an owned `out` buffer is supplied. `make_slot()` allocates owned pixels and a CUDA `ready` event: consumers must wait on that event, and callers must drain all readers before reusing slots or closing a renderer. Helpers close only environments they created.
+
+LeRobot integration, contact-audit policy, codec workers, scheduling and datasets remain in the vla repository. Run the extension tests with `MUJOCO_GL=egl python -m pytest tests` in an environment with MuJoCo Warp, Torch and pytest.
 
 
 # Overview
