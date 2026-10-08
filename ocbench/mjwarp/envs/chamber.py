@@ -276,9 +276,7 @@ class ChamberMjWarpEnv(ManipulationMjWarpEnv):
             inputs=[self._data.qpos, self._gpu_button_qpos_addrs, self._gpu_prev_button_qpos],
             device=device,
         )
-        for _ in range(self._cpu_env._n_steps):
-            self._mjw.step(self._model, self._data)
-        self._mjw.rne_postconstraint(self._model, self._data)
+        self._advance_control_substeps()
         self._wp.launch(
             self._kernels.update_button_states,
             dim=self._nworld,

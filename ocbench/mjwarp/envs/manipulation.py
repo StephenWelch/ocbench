@@ -46,6 +46,8 @@ class ManipulationMjWarpEnv:
         self._failure = None
         self._healthy = None
         self._step_graph = None
+        self._before_control_step = None
+        self._after_substep = None
         self._can_capture_step_graph = False
         self._ik_kernels = None
         self._kernels = None
@@ -291,10 +293,31 @@ class ManipulationMjWarpEnv:
         info['healthy'] = self._healthy.copy()
         return ob, info
 
-    def _launch_mjwarp_control_step_sequence(self):
+    def set_control_step_callbacks(self, *, before=None, after_substep=None):
+        """Register GPU-launch callbacks taking this environment as their argument.
+
+        Callbacks execute while building the CUDA graph, not in Python on every
+        replay. They must enqueue capture-safe GPU work, without host readback.
+        Register between control steps; changing callbacks invalidates the graph.
+        """
+        if any(callback is not None and not callable(callback) for callback in (before, after_substep)):
+            raise TypeError('Control-step callbacks must be callable or None.')
+        self._before_control_step = before
+        self._after_substep = after_substep
+        self._step_graph = None
+        self._can_capture_step_graph = False
+
+    def _advance_control_substeps(self):
+        if self._before_control_step is not None:
+            self._before_control_step(self)
         for _ in range(self._cpu_env._n_steps):
             self._mjw.step(self._model, self._data)
+            if self._after_substep is not None:
+                self._after_substep(self)
         self._mjw.rne_postconstraint(self._model, self._data)
+
+    def _launch_mjwarp_control_step_sequence(self):
+        self._advance_control_substeps()
 
     def _run_mjwarp_control_step(self):
         if self._use_cuda_graph and self._step_graph is not None:
@@ -359,6 +382,30 @@ class ManipulationMjWarpEnv:
         arrays.update(self._get_task_arrays())
         return arrays
 
+    def get_arrays(self, *, packed=False, stream=None):
+        """Read native transition inputs, optionally with one stream-scoped copy.
+
+        The reference path remains the default. Packed readback requires Torch;
+        ``stream`` is the Warp stream used for physics (the current one by default).
+        Task-specific arrays are included on both paths.
+        """
+        if not packed:
+            return self._get_arrays()
+        import torch
+
+        fields = ('qpos', 'qvel', 'ctrl', 'mocap_pos', 'mocap_quat', 'time', 'site_xpos', 'site_xmat', 'cfrc_ext')
+        stream = stream if stream is not None else self._wp.get_stream(self._data.qpos.device)
+        with self._wp.ScopedStream(stream), torch.cuda.stream(self._wp.stream_to_torch(stream)):
+            views = [self._wp.to_torch(getattr(self._data, key)) for key in fields]
+            sizes = [value.numel() for value in views]
+            values = torch.cat([value.flatten() for value in views]).cpu().numpy()
+            arrays = {
+                key: value.reshape(tuple(view.shape))
+                for key, view, value in zip(fields, views, np.split(values, np.cumsum(sizes)[:-1]))
+            }
+            arrays.update(self._get_task_arrays())
+        return arrays
+
     def _get_task_arrays(self):
         return {}
 
@@ -368,7 +415,9 @@ class ManipulationMjWarpEnv:
         if action.shape == self.single_action_space.shape:
             action = np.broadcast_to(action, (self._nworld, *self.single_action_space.shape)).copy()
         if action.shape != (self._nworld, *self.single_action_space.shape):
-            raise ValueError(f'Expected action shape {(self._nworld, *self.single_action_space.shape)} but got {action.shape}.')
+            raise ValueError(
+                f'Expected action shape {(self._nworld, *self.single_action_space.shape)} but got {action.shape}.'
+            )
 
         action = np.clip(action, -1.0, 1.0) * self._cpu_env._joint_action_delta
         qpos_target = qpos[:, self._arm_joint_ids] + action[:, :6]
@@ -577,19 +626,26 @@ class ManipulationMjWarpEnv:
     def _before_step_joint_actions_gpu(self):
         pass
 
-    def step_joint_actions_gpu(self, action, done=None):
+    def step_joint_actions_gpu(self, action, done=None, *, arm_mode='delta', gripper_mode='delta'):
         if self._data is None:
             self.reset()
         self._ensure_ik_buffers()
         self._ensure_gpu_step_buffers()
 
         self._before_step_joint_actions_gpu()
-        self.set_joint_action_control_gpu(action, done)
+        self.set_joint_action_control_gpu(action, done, arm_mode=arm_mode, gripper_mode=gripper_mode)
         self.advance_physics_gpu()
         self.compute_success_gpu()
         return self._gpu_success
 
-    def set_joint_action_control_gpu(self, action, done=None):
+    def set_joint_action_control_gpu(self, action, done=None, *, arm_mode='delta', gripper_mode='delta'):
+        """Set native delta or absolute arm/gripper targets for unfinished worlds.
+
+        Absolute arm targets are radians; absolute gripper targets are normalized
+        openings in [0, 1]. Each is clipped to the native actuator limits.
+        """
+        if arm_mode not in ('delta', 'absolute') or gripper_mode not in ('delta', 'absolute'):
+            raise ValueError('Joint action modes must be delta or absolute.')
         if self._data is None:
             self.reset()
         self._ensure_ik_buffers()
@@ -621,6 +677,37 @@ class ManipulationMjWarpEnv:
             device=device,
         )
 
+        if arm_mode == 'absolute' or gripper_mode == 'absolute':
+            from ocbench.mjwarp.joint_actions import set_absolute_arm, set_absolute_gripper
+
+            if arm_mode == 'absolute':
+                wp.launch(
+                    set_absolute_arm,
+                    dim=self._nworld,
+                    inputs=[
+                        action,
+                        self._gpu_done,
+                        self._gpu_arm_actuator_ids,
+                        self._gpu_arm_ctrl_low,
+                        self._gpu_arm_ctrl_high,
+                        self._data.ctrl,
+                    ],
+                    device=device,
+                )
+            if gripper_mode == 'absolute':
+                wp.launch(
+                    set_absolute_gripper,
+                    dim=self._nworld,
+                    inputs=[
+                        action,
+                        self._gpu_done,
+                        self._gpu_gripper_actuator_ids,
+                        self._data.ctrl,
+                        len(self._gripper_actuator_ids),
+                    ],
+                    device=device,
+                )
+
     def advance_physics_gpu(self):
         self._ensure_step_graph()
         self._run_mjwarp_control_step()
@@ -636,7 +723,16 @@ class ManipulationMjWarpEnv:
 
         self._ensure_step_graph()
         self._run_mjwarp_control_step()
-        arrays = self._get_arrays()
+        return self.finalize_transition(action)
+
+    def finalize_transition(self, action, arrays=None):
+        """Compute native observations/outcomes after physics without advancing it.
+
+        External GPU action loops may supply arrays from ``get_arrays``. This
+        shares ordinary step's finite-transition and constraint-capacity checks.
+        """
+        if arrays is None:
+            arrays = self.get_arrays()
         self._post_step(arrays)
 
         ob_info = self.compute_ob_info(arrays)
@@ -690,4 +786,5 @@ class ManipulationMjWarpEnv:
         return self.render_world(0, *args, **kwargs)
 
     def close(self):
+        self.set_control_step_callbacks()
         self._cpu_env.close()

@@ -26,6 +26,18 @@
 </div>
 
 
+# VLA integration fork
+
+The `vla-integration` branch is based on upstream commit `e2cd2f72110b66bd65afab1b855d81ebc73aeacc`. It preserves native tasks and outcomes while adding simulator APIs used by [vla](https://github.com/StephenWelch/vla):
+
+- `set_control_step_callbacks(before=..., after_substep=...)` registers capture-safe GPU work and invalidates the CUDA graph when callbacks change. Callbacks receive the environment and must not read back GPU data. Chamber/switch retain their task-specific control sequences.
+- `step_joint_actions_gpu` and `set_joint_action_control_gpu` accept `arm_mode` and `gripper_mode`: `"delta"` (default) or `"absolute"`. Absolute arm targets are radians; absolute gripper targets are normalized openings. Native clipping and finished-world behavior are preserved.
+- `get_arrays(packed=True, stream=...)` reads native transition inputs with one packed copy on the supplied Warp stream; it requires Torch. The default reference readback remains available.
+- `finalize_transition(action, arrays=None)` computes native observations, rewards, termination and numerical-failure checks after externally executed physics. Ordinary `step` uses the same method.
+
+LeRobot integration, contact-audit policy, video rendering and datasets remain in the vla repository. Run the extension tests with `MUJOCO_GL=egl python -m pytest tests/test_vla_extensions.py` in an environment with MuJoCo Warp, Torch and pytest.
+
+
 # Overview
 
 OCBench is a controllable robotic manipulation benchmark for studying behavioral cloning (BC) and reinforcement learning (RL).
